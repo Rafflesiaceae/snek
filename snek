@@ -1,0 +1,482 @@
+#!/usr/bin/env dash
+# snek v0.1 (2022-09-25) (c0ab5ff49c51e779)
+#
+# is a self-contained wrapper/boostrapper around micromamba/conda-lock written
+# in POSIX shell, to either lock and/or create a conda environment and/or run
+# commands inside it
+#
+# you can use it to, with little overhead, run a command in a conda environment
+# specified by a `.lock` file that someone gave you, even without having conda
+# installed
+#
+# REQUIRES: grep sed tar bzip2 sha256sum curl
+#
+# HOW IT WORKS
+#
+# NOTE: terms like conda, mamba or micromamba are mostly interchangeable
+#
+# first of all, it might go hissssss... at any time, then it will fetch and use
+# a remote micromamba bin if it hasn't fetched it before
+#
+# from there it depends how you started snek:
+#
+# if you have passed a `*.lock` file to snek, snek does not need to invoke
+# `conda-lock`, as `.lock` files are what conda calls "EXPLICIT" format, which
+# means that no dependency resolution needs to run as it ran prior to producing
+# one, this is currently considered the only "reproducible" way of recreating
+# conda environments - in this case snek will just check if there already is an
+# existing conda environment for the given `.lock` file, if not create one
+# itself and finally given that you passed a command it will execute it inside
+# of the conda environment - if the required conda environment still exists,
+# consequent invocations should be *fast* thanks due to `micromamba`s native
+# implementation
+#
+# if you have passed a `*-lock.yml`, snek will first ensure there is a local
+# conda environment present that has `conda-lock` inside it and will create one
+# itself if need be, then invoke `conda-lock`s `render` command on the `.yml`
+# file, which, if it passes successfully, will produce a `*.lock` file as
+# described above - snek then goes on to invoke itself onto the `*.lock` file
+# mentioned in the last paragraph - the `*-lock.yml` file itself still requires
+# dependency resolution of the conda distribution and thus is not considered
+# reproducible by itself according to their own description
+#
+# if you have passed an `*-env.yml`, snek will ensure there is a local conda
+# environment, called 'meta-lock-env', it will then invoke `conda-lock`'s `lock`
+# command on the `.yml` file inside 'meta-lock-env', which, if it passes
+# successfully, will produce a `*.lock` file as described above - snek then goes
+# on to invoke itself onto the `*.lock` file
+set -e
+
+micromamba_version=0.25.1
+micromamba_pkg_fname="micromamba-${micromamba_version}-0.tar.bz2"
+micromamba_pkg_url="https://anaconda.org/conda-forge/micromamba/${micromamba_version}/download/linux-64/${micromamba_pkg_fname}"
+micromamba_pkg_sha256="2d8ab91435ea75e4b76412795742b6a17ff25f6d7081a9411a1bc96688e1f7d1"
+
+# {{{1 cfg
+cached=${XDG_CACHE_HOME:-$HOME/.cache}
+cached=${cached}/snek
+
+meta_lock_env_version=v0
+first_philosophy=${cached}/meta-lock-env/${meta_lock_env_version}
+
+snek_prefix=${cached}/envs
+
+if [ ! -d "$cached" ]      ; then mkdir -p "$cached"      ; fi
+if [ ! -d "$snek_prefix" ] ; then mkdir -p "$snek_prefix" ; fi
+
+# {{{1 cli
+info() {
+    printf '🐍 %b\n' "$1" >&2
+}
+err() {
+    printf '💀 %b\n' "$1" >&2
+}
+die() {
+    err "$1"
+    exit "${2-1}"
+}
+usage() {
+    echo "🐍 usage: [-h|--help] [-v|--version] [-b|--boa] [-c|--clean] [-cb|--clean-builds] [-f|--force] [-fd|--force-dist] [-F] <spec-file>"
+    exit "${1:-1}"
+}
+cleand() { [ -d "$!" ] && rm -rf "$1"; }
+
+boa=
+force=
+force_dist=
+spec_file=
+while :; do
+    case $1 in
+        -h|-\?|--help)
+            usage 0
+            ;;
+        -v|--version)
+            version=$(sed '2q;d' "$0")
+            version=${version#\#\ }
+            echo "$version"
+            exit 0
+            ;;
+        -b|--boa)
+            info "using boa for meta.yaml"
+            boa=1
+            ;;
+        -c|--clean)
+            info "cleaning snek cached: ${cached}"
+            cleand "$cached"
+            exit 0
+            ;;
+        -cb|--clean-builds)
+            info "cleaning locally built packages"
+            cleand "${first_philosophy}/conda-bld"
+            exit 0
+            ;;
+        -F)
+            info "forcing recreation of the snek dist and spec files"
+            force=1
+            force_dist=1
+            force_dist_meta_lock_env=1
+            ;;
+        -f|--force)
+            info "forcing recreation of spec files"
+            force=1
+            ;;
+        -fd|--force-dist)
+            info "forcing recreation of the snek dist"
+            force_dist=1
+            force_dist_meta_lock_env=1
+            ;;
+        --)
+            if [ "$#" -gt 0 ]; then shift; else usage; fi
+            break
+            ;;
+        -?*) printf 'ERROR: Unknown option: %s\n' "$1" >&2; usage ;;
+        *)
+            if [ ! "$input" ]; then
+                input=$1
+            else
+                break
+            fi
+            ;;
+    esac
+
+    if [ "$#" -gt 0 ]; then shift; else usage; fi
+done
+[ ! "$input" ] && usage
+
+# {{{1 main-functions
+sh256fn() { local hash; hash=$(sha256sum -); printf "%s" "${hash%\ \ *}"; }
+enter_tmpdir() {
+    tmpdir=$(mktemp -d)
+    cleanup_tmpdir() {
+        rm -rf "$tmpdir"
+    }
+    trap 'cleanup_tmpdir' EXIT
+
+    tmpdir_previous_path=$PWD
+    cd "$tmpdir"
+}
+leave_tmpdir() {
+    cd "$tmpdir_previous_path"
+
+    cleanup_tmpdir
+    trap - EXIT
+}
+is_installed() { command -v "$1" >/dev/null 2>/dev/null; }
+mkdirp_file() {
+    file_mkdirp_dirname=$(dirname "$1")
+    if [ ! -d "$file_mkdirp_dirname" ]; then
+        mkdir -p "$file_mkdirp_dirname"
+    fi
+}
+
+
+ensure_local_micromamba() {
+    # make sure we have a usable micromamba bin
+
+    micromamba_bin="${cached}/micromamba/micromamba.${micromamba_version}"
+    micromamba_success_path="${cached}/micromamba/micromamba.${micromamba_version}.success"
+
+    need_micromamba_fetch=
+    if [ "$force_dist" ]; then
+        need_micromamba_fetch=1
+    elif [ -e "$micromamba_bin" ] && [ -e "$micromamba_success_path" ]; then
+        : # it's usable
+    else
+        info "no local micromamba (${micromamba_version}) found, fetching remote one..."
+        need_micromamba_fetch=1
+    fi
+
+    if [ "$need_micromamba_fetch" ]; then
+        enter_tmpdir
+
+        info "fetching $micromamba_pkg_url ..."
+        curl -L "$micromamba_pkg_url" -o "$micromamba_pkg_fname" || die "failed to fetch '${micromamba_pkg_url}' via curl"
+
+        info "verifying $micromamba_pkg_fname ..."
+        fetched_sha256=$(sh256fn < "$micromamba_pkg_fname")
+        if [ "$fetched_sha256" != "$micromamba_pkg_sha256" ]; then
+            die "${micromamba_pkg_fname} has a wrong sha256 checksum!\n\texpected: ${micromamba_pkg_sha256}\n\tfetched:  ${fetched_sha256}"
+        fi
+
+        info "unpacking $micromamba_pkg_fname ..."
+        tar -xf "$micromamba_pkg_fname" || die "failed to unpack '$micromamba_pkg_fname' via tar -xf"
+
+        if [ ! -e "./bin/micromamba" ]; then
+            die "failed to unpack 'bin/micromamba', archive seems wrong or damaged"
+        fi
+
+        fetched_bin_version=$(./bin/micromamba --version) || die "failed to execute fetched micromamba bin"
+        if [ "$fetched_bin_version" != "$micromamba_version" ]; then
+            die "${micromamba_pkg_fname}'s bin version ($fetched_bin_version) doesn't match the required version: ${micromamba_version}"
+        fi
+
+        printf "%s\n" "$fetched_bin_version" > micromamba.version
+
+        mkdirp_file "$micromamba_bin"
+        mv "./bin/micromamba" "$micromamba_bin" || die "failed to move '$(realpath "./bin/micromamba")' to '${cached}/'"
+        touch "$micromamba_success_path"
+
+        leave_tmpdir
+    fi
+}
+
+ensure_meta_lock_env() {
+    # make sure we have a usable conda-lock environment
+
+    # @XXX
+    # conda-lock depends on `python-poetry` and they seem to have messed their
+    # "DyNaMiC" import scheme up so badly, that even tho poetry just bumped
+    # their minor version once, `conda-lock` is still busy trying to figure out
+    # how to fix it on their end ↓
+    # https://github.com/conda-incubator/conda-lock/issues/235
+    #
+    # so at this point actually the only sane cross-distro way to use
+    # `conda-lock` with pip features seems to be to create a conda environment,
+    # pull `conda-lock` from conda-forge and then run it from there
+    #
+    # Wir sagen, wir geben eine Theatervorstellung, prolongiert ohne Zweifel in
+    # die Unendlichkeit, aber das Theater, in welchem wir auf alles gefaßt und
+    # in nichts kompetent sind, ist, seit wir denken können, immer ein solches
+    # der sich vergrößernden Geschwindigkeit und der verpaßten Stichwörter. Wir
+    # wissen nicht, handelt es sich um die Tragödie um der Komödie, oder um die
+    # Komödie um der Tragödie willen.
+    if [ "$force_dist_meta_lock_env" ] || [ ! -e "${first_philosophy}/conda-meta/success" ]; then
+        unset -v force_dist_meta_lock_env
+        if [ -d "$first_philosophy" ]; then
+            info "reinitializing meta-lock-env"
+            rm -rf "$first_philosophy"
+        else
+            info "initializing meta-lock-env"
+        fi
+
+        "$micromamba_bin" create --quiet --yes \
+            --prefix "$first_philosophy" \
+            -c nodefaults \
+            -c conda-forge \
+            conda-lock mamba yq boa >&2
+
+        # attempt to check that the environment was successfully created
+        if [ -e "${first_philosophy}/bin/conda-lock" ]; then
+            touch "${first_philosophy}/conda-meta/success"
+            info "successfully created the meta-lock-env"
+        else
+            die "something went wrong while creating the meta-lock-env"
+        fi
+    fi
+}
+
+snek_run() {
+    prefix=$1
+    shift || die "snek_run usage: <prefix> <cmds>*"
+    "$micromamba_bin" run -a stdin,stdout,stderr --prefix "$prefix" --label "snek-run" "$@"
+}
+
+meta_lock_run() {
+    info "  → running in meta-lock-env: $*"
+    snek_run "$first_philosophy" "$@"
+}
+
+meta_lock_filter_pip_exclude() {
+cat <<'EOF' | meta_lock_run python3
+import re
+
+with open("./pip-exclude") as f:
+    pip_exclude = f.read().splitlines()
+
+filter_re = "|".join(["^#\ pip\ "+re.escape(x)+"\ @" for x in pip_exclude])
+
+with open("./conda-linux-64-final.lock", "w") as dest:
+    with open("./conda-linux-64.lock") as src:
+        for line in src.readlines():
+            if filter_re and re.search(filter_re, line):
+                continue
+            dest.write(line)
+EOF
+}
+
+env_has_outdated_hash() {
+    env=$1
+    shift || die "pass env"
+    expected_hash=$1
+    shift || die "pass expected_hash"
+
+    snek_hash_path=${env}/conda-meta/snek-hash
+    if [ ! -e "${snek_hash_path}" ] || [ "$(cat "$snek_hash_path")" = "$expected_hash" ]; then
+        return 1
+    fi
+}
+
+process() {
+    inputf="$1"
+    shift
+    case "$inputf" in
+        *-env.yml) # an environment file, can be locked
+            env_name=${inputf%-env.yml}
+            env_name="$(basename "$(realpath "$env_name")")"
+
+            target_filename="${env_name}.lock"
+            target_file="${spec_dir}/${target_filename}"
+            target_env_hash=$(sh256fn < "$inputf")
+            target_env_hash=$(printf "%b/%b" "$target_env_hash" "$meta_lock_env_version" | sh256fn) # part of the hash is the version of the meta-lock-env it was created with
+
+            # determine if a previously created '.lock' file was made with a
+            # different hash
+            hash_changed=1
+            if [ -e "$target_file" ]; then
+                recorded_hash=$(grep -oP "# snek-hash: \K(.*)" -m 1 < "$target_file" || true)
+                if [ "$target_env_hash" = "$recorded_hash" ]; then
+                    unset -v hash_changed
+                elif [ -n "$recorded_hash" ]; then
+                    info "hash changed: recorded '${recorded_hash}' != target '${target_env_hash}'"
+                else
+                    info "${target_filename} lacked snek-hash info, i.e. not created by us, recreating..."
+                fi
+            fi
+
+            if [ "$force" ] || [ "$hash_changed" ]; then
+                ensure_meta_lock_env
+
+                info "start - locking ${inputf} (this can take some time)"
+
+                # @XXX conda-lock can have weird crashes when passing --lockfile
+                # or --file, we're not going to tempt the deities, so we use
+                # it's defaults in a tmpdir
+                enter_tmpdir
+
+                cp "$inputf" environment.yml
+                meta_lock_run conda-lock --platform 'linux-64' --mamba --kind explicit --strip-auth >&2
+                info "  → done locking, continuing preprocessing..."
+
+                # @XXX
+                # here comes some fun stuff, conda-lock doesn't seem to really
+                # care when resolving pip dependencies if python packages are
+                # already present in the conda-env, this means that often pip
+                # dependencies pull in transient dependencies that we don't want
+                # because we already got them through conda pkgs - so we
+                # monkeypatch a way to circumvent this, by adding our own
+                # 'pip-exclude' key to the '*-env.yml' file and then throwing
+                # out the pip packages listed there from the '*.lock' file
+                #
+                # without this it is impossible to install some pip packages, as
+                # they pull in transient dependencies that always abort the 'pip
+                # install' phase, the idea being that these pip packages ought
+                # to have been installed prior through the system's package
+                # manager, 'rpm' is such a pip package
+                meta_lock_run yq -r '."pip-exclude"[]?' < "environment.yml" > "./pip-exclude"
+                meta_lock_filter_pip_exclude
+                meta_lock_filter_pip_exclude_result="conda-linux-64-final.lock"
+
+                # record the snek hash so that we can somewhat detect the
+                # necessity for rebuilds ourselves
+                printf "# snek-hash: %b\n" "$target_env_hash" >> "$meta_lock_filter_pip_exclude_result"
+
+                mv -f "$meta_lock_filter_pip_exclude_result" "$target_file"
+
+                info "done  - locking ${inputf}"
+
+                leave_tmpdir
+            fi
+
+            process "$target_file"
+            ;;
+        *.lock) # a rendered lockfile, consumable by conda
+            env_name=${inputf%.lock}
+            env_name="$(basename "$(realpath "$env_name")")"
+
+            lockfile_hash=$(sh256fn < "$inputf")
+
+            env_dirname=snek-${env_name}-${lockfile_hash}
+            target_env=${snek_prefix}/${env_dirname}
+
+            # (re)create the environment if necessary
+            if [ "$force" ] || [ ! -e "${target_env}/conda-meta/success" ]; then
+                if [ -d "$target_env" ]; then
+                    info "start - reinitializing env '${env_dirname}'"
+                    rm -rf "$target_env"
+                else
+                    info "start - initializing env '${env_dirname}'"
+                fi
+
+                "$micromamba_bin" create --yes --prefix "$target_env" --file "$inputf" >&2
+
+                # pip packages have to be installed separately until
+                # https://github.com/mamba-org/mamba/pull/1908 has landed
+                pip_requirements=$(awk '/^# pip / { print(substr($0, 7))}' "$inputf")
+                if [ -n "$pip_requirements" ]; then
+                    info "  installing pip dependencies..."
+
+                    tmpfile=$(mktemp)
+                    cleanup_tmpfile() {
+                        rm -f "$tmpfile"
+                    }
+                    trap 'cleanup_tmpfile' EXIT
+
+                    printf "%b" "$pip_requirements" > "$tmpfile"
+                    snek_run "$target_env" python3 -m pip install --no-deps --prefix "${target_env}" -r "$tmpfile" >&2
+
+                    cleanup_tmpfile
+                fi
+
+                touch "${target_env}/conda-meta/success"
+
+                info "done  - initializing env '${env_dirname}'"
+            fi
+            ;;
+        */meta.yaml) # a meta yaml pkg definition, can be build via boa
+            ensure_meta_lock_env
+            info "building meta.yaml ..."
+            recipe_path=${inputf%meta.yaml}recipe.yaml
+            # echo "$recipe_path"
+            # exit 0
+
+            # @INFO 'boa' is not yet ready for widespread usage and bug reports
+            # are not given any attention as of now (25.09.2022), the next best
+            # thing which seems to work fine is `conda-build mambabuild`, which
+            # is plain `conda-build` but swaps the resolve to `mamba`
+            if [ "$boa" ]; then
+                meta_lock_run sh -c "boa convert '${inputf}' > '$recipe_path'; boa build --interactive ${recipe_path}"
+            else
+                meta_lock_run conda-build mambabuild "${spec_dir}" "$@"
+            fi
+            exit 0
+            ;;
+    esac
+}
+
+# {{{1 main
+case "$(uname -m)" in
+    x86_64) ;;
+    *) die "unsupported architecture, currently only 'x86_64' is supported" ;;
+esac
+
+# disable micromamba printing additional snakes
+export MAMBA_NO_BANNER=1
+
+# make sure we have a micromamba bin to use
+ensure_local_micromamba
+
+case $input in
+    "init")
+        ensure_meta_lock_env
+        ;;
+    "init-run")
+        # we already called ensure_local_micromamba
+        ;;
+    *) # a spec-file
+        # prepare spec dir
+        spec_file="$(realpath "$input")"
+        if [ ! -e "$spec_file" ]; then err "spec-file: '${spec_file}' is not a readable file"; usage 1; fi
+        spec_dir=$(dirname "$spec_file")
+
+        # init phase done, now process whatever spec file was passed
+        process "$spec_file" "$@"
+
+        # optionally run a command passed to us
+        if [ "$#" -gt 0 ]; then
+            snek_run "$target_env" "$@"
+        fi
+        ;;
+esac
+
+exit 0
+# vim: set ft=sh ts=4 sw=4 et:
