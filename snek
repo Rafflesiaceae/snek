@@ -1,5 +1,5 @@
 #!/usr/bin/env dash
-# snek v0.1 (2022-09-25) (c0ab5ff49c51e779)
+# snek v0.1 (2022-09-25) (1572d186b5e0bdc5)
 #
 # is a self-contained wrapper/boostrapper around micromamba/conda-lock written
 # in POSIX shell, to either lock and/or create a conda environment and/or run
@@ -144,7 +144,7 @@ done
 [ ! "$input" ] && usage
 
 # {{{1 main-functions
-sh256fn() { local hash; hash=$(sha256sum -); printf "%s" "${hash%\ \ *}"; }
+sh256fn() { hash; hash=$(sha256sum -); printf "%s" "${hash%\ \ *}"; }
 enter_tmpdir() {
     tmpdir=$(mktemp -d)
     cleanup_tmpdir() {
@@ -161,7 +161,6 @@ leave_tmpdir() {
     cleanup_tmpdir
     trap - EXIT
 }
-is_installed() { command -v "$1" >/dev/null 2>/dev/null; }
 mkdirp_file() {
     file_mkdirp_dirname=$(dirname "$1")
     if [ ! -d "$file_mkdirp_dirname" ]; then
