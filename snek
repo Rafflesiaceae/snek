@@ -144,7 +144,7 @@ done
 [ ! "$input" ] && usage
 
 # {{{1 main-functions
-sh256fn() { hash; hash=$(sha256sum -); printf "%s" "${hash%\ \ *}"; }
+sh256fn() { hash=$(sha256sum -); printf "%s" "${hash%\ \ *}"; }
 enter_tmpdir() {
     tmpdir=$(mktemp -d)
     cleanup_tmpdir() {
